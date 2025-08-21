@@ -48,6 +48,7 @@ const disconnectedConnectionState = {
   completionsSupported: false,
   connect: jest.fn(),
   disconnect: jest.fn(),
+  lastError: null as Error | null,
 };
 
 // Connected state for tests that need an active connection

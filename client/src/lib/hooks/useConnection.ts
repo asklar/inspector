@@ -111,6 +111,7 @@ export function useConnection({
     { request: string; response?: string }[]
   >([]);
   const [completionsSupported, setCompletionsSupported] = useState(false);
+  const [lastError, setLastError] = useState<Error | null>(null);
 
   useEffect(() => {
     if (!oauthClientId) {
@@ -348,6 +349,19 @@ export function useConnection({
   };
 
   const connect = async (_e?: unknown, retryCount: number = 0) => {
+    // Prevent parallel connect attempts
+    if (connectionStatus === "connecting" || connectionStatus === "connected") {
+      return;
+    }
+    setConnectionStatus("connecting");
+    setLastError(null);
+    console.log("[connection] Starting connect attempt", {
+      transportType,
+      command,
+      args,
+      sseUrl,
+      retryCount,
+    });
     const client = new Client<Request, Notification, Result>(
       {
         name: "mcp-inspector",
@@ -600,7 +614,13 @@ export function useConnection({
 
       setMcpClient(client);
       setConnectionStatus("connected");
+      console.log("[connection] Connected", {
+        capabilities: !!capabilities,
+        transportType,
+      });
     } catch (e) {
+      console.error("[connection] Connection failed", e);
+      setLastError(e instanceof Error ? e : new Error(String(e)));
       if (
         lastRequest === "logging/setLevel" &&
         e instanceof McpError &&
@@ -612,12 +632,12 @@ export function useConnection({
           variant: "destructive",
         });
       }
-      console.error(e);
       setConnectionStatus("error");
     }
   };
 
   const disconnect = async () => {
+    console.log("[connection] Disconnect requested", { transportType });
     if (transportType === "streamable-http")
       await (
         clientTransport as StreamableHTTPClientTransport
@@ -628,8 +648,10 @@ export function useConnection({
     setMcpClient(null);
     setClientTransport(null);
     setConnectionStatus("disconnected");
+    console.log("[connection] Disconnected");
     setCompletionsSupported(false);
     setServerCapabilities(null);
+    setLastError(null);
   };
 
   return {
@@ -643,5 +665,6 @@ export function useConnection({
     completionsSupported,
     connect,
     disconnect,
+    lastError,
   };
 }

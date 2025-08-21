@@ -20,6 +20,12 @@ import express from "express";
 import { findActualExecutable } from "spawn-rx";
 import mcpProxy from "./mcpProxy.js";
 import { randomUUID, randomBytes, timingSafeEqual } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { access } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { CompatibilityCallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 
 const DEFAULT_MCP_PROXY_LISTEN_PORT = "6277";
 const SSE_HEADERS_PASSTHROUGH = ["authorization"];
@@ -393,10 +399,8 @@ app.get(
 
       const webAppTransport = new SSEServerTransport("/message", res);
       console.log("Created client transport");
-
       webAppTransports.set(webAppTransport.sessionId, webAppTransport);
       serverTransports.set(webAppTransport.sessionId, serverTransport);
-
       await webAppTransport.start();
 
       (serverTransport as StdioClientTransport).stderr!.on("data", (chunk) => {
@@ -474,7 +478,6 @@ app.get(
         console.log("Created client transport");
         serverTransports.set(webAppTransport.sessionId, serverTransport!);
         console.log("Created server transport");
-
         await webAppTransport.start();
 
         mcpProxy({
@@ -527,6 +530,15 @@ app.get("/config", originValidationMiddleware, authMiddleware, (req, res) => {
       defaultArgs: values.args,
       defaultTransport: values.transport,
       defaultServerUrl: values["server-url"],
+      onDeviceRegistry: cachedOnDeviceRegistry
+        ? {
+            registryPath: cachedOnDeviceRegistry.registryPath,
+            registryArgs: cachedOnDeviceRegistry.registryArgs,
+            servers: cachedOnDeviceRegistry.servers,
+            ready: cachedOnDeviceRegistry.ready,
+            lastEnumerated: cachedOnDeviceRegistry.lastEnumerated,
+          }
+        : null,
     });
   } catch (error) {
     console.error("Error in /config route:", error);
@@ -553,6 +565,50 @@ server.on("listening", () => {
       `⚠️  WARNING: Authentication is disabled. This is not recommended.`,
     );
   }
+  // Kick off an async check for on-device registry availability purely for logging
+  (async () => {
+    try {
+      const execInfo = await getOnDeviceRegistryExecutableInfo();
+      if (!execInfo) {
+        console.log(
+          `[on-device][server] No registry executable detected (platform='${process.platform}'). Standard mode only.`,
+        );
+        cachedOnDeviceRegistry = null;
+        return;
+      }
+      cachedOnDeviceRegistry = {
+        registryPath: execInfo.path,
+        registryArgs: execInfo.args,
+        servers: [],
+        ready: false,
+        lastEnumerated: null,
+      };
+      console.log(
+        `[on-device][server] Registry executable detected at '${execInfo.path}' args=${JSON.stringify(execInfo.args)}. Enumerating servers before client launch...`,
+      );
+      try {
+        const servers = await listOnDeviceServers(execInfo.path, execInfo.args);
+        if (cachedOnDeviceRegistry) {
+          cachedOnDeviceRegistry.servers = servers;
+          cachedOnDeviceRegistry.ready = true;
+          cachedOnDeviceRegistry.lastEnumerated = Date.now();
+        }
+        console.log(
+          `[on-device][server] Pre-enumeration complete: ${servers.length} server(s) cached.`,
+        );
+      } catch (e) {
+        console.warn(
+          `[on-device][server] Pre-enumeration failed; will rely on on-demand endpoint:`,
+          e,
+        );
+      }
+    } catch (e) {
+      console.warn(
+        `[on-device][server] Error during initial registry availability check:`,
+        e,
+      );
+    }
+  })();
 });
 server.on("error", (err) => {
   if (err.message.includes(`EADDRINUSE`)) {
@@ -562,3 +618,208 @@ server.on("error", (err) => {
   }
   process.exit(1);
 });
+
+// -------------------------------------------------------------
+// On-device MCP registry support (Windows only)
+// -------------------------------------------------------------
+
+const execFileAsync = promisify(execFile);
+
+interface OnDeviceServerEntry {
+  id: string;
+  name: string;
+  description?: string;
+  version?: string;
+  author?: string;
+  tags?: string[];
+  type: string; // stdio | sse | streamable-http
+  command: string;
+  args?: string[];
+  source?: string;
+}
+interface OnDeviceRegistryExecInfo {
+  path: string;
+  args: string[];
+}
+
+let cachedOnDeviceRegistry: {
+  registryPath: string;
+  registryArgs: string[];
+  servers: OnDeviceServerEntry[];
+  ready: boolean;
+  lastEnumerated: number | null;
+} | null = null;
+
+async function getOnDeviceRegistryExecutableInfo(): Promise<OnDeviceRegistryExecInfo | null> {
+  if (process.platform !== "win32") return null;
+  try {
+    // Using PowerShell to read Path & Args (REG_EXPAND_SZ auto-expanded)
+    const psCommand = `
+      $key = Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Mcp' -ErrorAction SilentlyContinue;
+      if ($key) { Write-Output ($key.Path); Write-Output '---ARGS---'; Write-Output ($key.Args) }
+    `;
+    const { stdout } = await execFileAsync("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      psCommand,
+    ]);
+    const raw = stdout.trim();
+    let path = "";
+    let argsRaw = "";
+    if (raw.includes("---ARGS---")) {
+      const [p, rest] = raw.split(/---ARGS---/);
+      path = (p || "").trim();
+      argsRaw = (rest || "").trim();
+    } else {
+      path = raw; // older format without Args
+    }
+    console.log("[on-device] Registry Path value:", path || "<empty>");
+    console.log("[on-device] Registry Args raw:", argsRaw || "<none>");
+    if (!path) return null;
+    try {
+      await access(path, fsConstants.X_OK | fsConstants.F_OK);
+      console.log("[on-device] Executable accessible:", path);
+    } catch {
+      console.warn("[on-device] Executable path not accessible:", path);
+      return null;
+    }
+    // Parse args (allow quoted values). Reuse shell-quote parser (already imported as shellParseArgs earlier in file)
+    let parsedArgs: string[] = [];
+    try {
+      parsedArgs = argsRaw ? (shellParseArgs(argsRaw) as string[]) : [];
+    } catch (e) {
+      console.warn(
+        "[on-device] Failed to parse Args string, using raw split",
+        e,
+      );
+      parsedArgs = argsRaw ? argsRaw.split(/\s+/).filter(Boolean) : [];
+    }
+    console.log("[on-device] Parsed Args:", parsedArgs);
+    return { path, args: parsedArgs };
+  } catch (error) {
+    console.error(
+      "Failed to read on-device MCP registry executable info",
+      error,
+    );
+    return null;
+  }
+}
+
+async function listOnDeviceServers(
+  registryExe: string,
+  registryArgs: string[],
+): Promise<OnDeviceServerEntry[]> {
+  const transport = new StdioClientTransport({
+    command: registryExe,
+    args: registryArgs,
+    stderr: "pipe",
+  });
+  const client = new Client({
+    name: "mcp-inspector-ondevice",
+    version: "1.0.0",
+  });
+  try {
+    await client.connect(transport);
+    // Call the registry_list tool
+    const result = await client.request(
+      {
+        method: "tools/call",
+        params: {
+          name: "registry_list",
+          arguments: {},
+          _meta: { progressToken: 0 },
+        },
+      },
+      CompatibilityCallToolResultSchema,
+    );
+    console.log(
+      "[on-device] Raw registry_list tool result content:",
+      (result as any).content,
+    );
+    // Expect first text content item to be JSON
+    const contentArray = (result as any).content as unknown[] | undefined;
+    if (!Array.isArray(contentArray)) return [];
+    const textItem = contentArray.find(
+      (c: any): c is { type: "text"; text: string } =>
+        c && c.type === "text" && typeof c.text === "string",
+    );
+    if (!textItem) return [];
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(textItem.text);
+      console.log(
+        "[on-device] Parsed registry_list JSON length:",
+        Array.isArray(parsed) ? parsed.length : "not-array",
+      );
+    } catch (e) {
+      console.error("Failed to parse registry_list tool output as JSON", e);
+      return [];
+    }
+    if (Array.isArray(parsed)) {
+      const servers = parsed as OnDeviceServerEntry[];
+      servers.forEach((s, i) => {
+        console.log(
+          `[on-device] Server[${i}] id='${s.id}' name='${s.name}' type='${s.type}' command='${s.command}' args=${JSON.stringify(s.args || [])}`,
+        );
+      });
+      return servers;
+    }
+    return [];
+  } finally {
+    try {
+      await client.close();
+    } catch {}
+    try {
+      transport.close();
+    } catch {}
+  }
+}
+
+app.get(
+  "/on-device/available-servers",
+  originValidationMiddleware,
+  authMiddleware,
+  async (_req, res) => {
+    try {
+      console.log("[on-device] /on-device/available-servers request received");
+      if (cachedOnDeviceRegistry && cachedOnDeviceRegistry.ready) {
+        console.log(
+          `[on-device] Serving cached registry servers (${cachedOnDeviceRegistry.servers.length})`,
+        );
+        res.json({
+          registryPath: cachedOnDeviceRegistry.registryPath,
+          registryArgs: cachedOnDeviceRegistry.registryArgs,
+          servers: cachedOnDeviceRegistry.servers,
+          cached: true,
+        });
+        return;
+      }
+      const execInfo = await getOnDeviceRegistryExecutableInfo();
+      if (!execInfo) {
+        console.log("[on-device] Registry executable not found or unavailable");
+        res.status(404).json({ error: "On-device MCP registry not available" });
+        return;
+      }
+      const servers = await listOnDeviceServers(execInfo.path, execInfo.args);
+      console.log(`[on-device] Returning ${servers.length} server(s)`);
+      cachedOnDeviceRegistry = {
+        registryPath: execInfo.path,
+        registryArgs: execInfo.args,
+        servers,
+        ready: true,
+        lastEnumerated: Date.now(),
+      };
+      res.json({
+        registryPath: execInfo.path,
+        registryArgs: execInfo.args,
+        servers,
+        cached: false,
+      });
+    } catch (error) {
+      console.error("Error listing on-device servers", error);
+      res.status(500).json({ error: "Failed to list on-device servers" });
+    }
+  },
+);

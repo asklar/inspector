@@ -59,6 +59,9 @@ import ResourcesTab from "./components/ResourcesTab";
 import RootsTab from "./components/RootsTab";
 import SamplingTab, { PendingRequest } from "./components/SamplingTab";
 import Sidebar from "./components/Sidebar";
+import OnDeviceSidebar, {
+  OnDeviceServerEntry,
+} from "./components/OnDeviceSidebar";
 import ToolsTab from "./components/ToolsTab";
 import { InspectorConfig } from "./lib/configurationTypes";
 import {
@@ -111,6 +114,16 @@ const App = () => {
   >([]);
   const [roots, setRoots] = useState<Root[]>([]);
   const [env, setEnv] = useState<Record<string, string>>({});
+  // On-device MCP registry state (Windows)
+  // undefined = still determining (suppress UI flicker), null = not available, []|[...] = available result
+  const [onDeviceServers, setOnDeviceServers] = useState<
+    OnDeviceServerEntry[] | null | undefined
+  >(navigator.userAgent.includes("Windows") ? undefined : null);
+  const [onDeviceDiscoveryLoading, setOnDeviceDiscoveryLoading] =
+    useState<boolean>(navigator.userAgent.includes("Windows"));
+  const [selectedOnDeviceServerId, setSelectedOnDeviceServerId] = useState<
+    string | null
+  >(null);
 
   const [config, setConfig] = useState<InspectorConfig>(() =>
     initializeInspectorConfig(CONFIG_LOCAL_STORAGE_KEY),
@@ -131,54 +144,58 @@ const App = () => {
     return localStorage.getItem("lastOauthScope") || "";
   });
 
+  type TrackedPendingRequest = PendingRequest & {
+    resolve: (r: CreateMessageResult) => void;
+    reject: (e: Error) => void;
+  };
+  type TrackedPendingElicitationRequest = PendingElicitationRequest & {
+    resolve: (r: ElicitationResponse) => void;
+    decline: (e: Error) => void;
+  };
   const [pendingSampleRequests, setPendingSampleRequests] = useState<
-    Array<
-      PendingRequest & {
-        resolve: (result: CreateMessageResult) => void;
-        reject: (error: Error) => void;
-      }
-    >
+    TrackedPendingRequest[]
   >([]);
   const [pendingElicitationRequests, setPendingElicitationRequests] = useState<
-    Array<
-      PendingElicitationRequest & {
-        resolve: (response: ElicitationResponse) => void;
-        decline: (error: Error) => void;
-      }
-    >
+    TrackedPendingElicitationRequest[]
   >([]);
-  const [isAuthDebuggerVisible, setIsAuthDebuggerVisible] = useState(false);
-
-  const [authState, setAuthState] =
-    useState<AuthDebuggerState>(EMPTY_DEBUGGER_STATE);
-
-  const updateAuthState = (updates: Partial<AuthDebuggerState>) => {
-    setAuthState((prev) => ({ ...prev, ...updates }));
-  };
-  const nextRequestId = useRef(0);
-  const rootsRef = useRef<Root[]>([]);
-
+  const [nextResourceCursor, setNextResourceCursor] = useState<
+    string | undefined
+  >(undefined);
+  const [nextResourceTemplateCursor, setNextResourceTemplateCursor] = useState<
+    string | undefined
+  >(undefined);
+  const [nextPromptCursor, setNextPromptCursor] = useState<string | undefined>(
+    undefined,
+  );
+  const [nextToolCursor, setNextToolCursor] = useState<string | undefined>(
+    undefined,
+  );
   const [selectedResource, setSelectedResource] = useState<Resource | null>(
     null,
   );
-  const [resourceSubscriptions, setResourceSubscriptions] = useState<
-    Set<string>
-  >(new Set<string>());
-
   const [selectedPrompt, setSelectedPrompt] = useState<Prompt | null>(null);
   const [selectedTool, setSelectedTool] = useState<Tool | null>(null);
-  const [nextResourceCursor, setNextResourceCursor] = useState<
-    string | undefined
-  >();
-  const [nextResourceTemplateCursor, setNextResourceTemplateCursor] = useState<
-    string | undefined
-  >();
-  const [nextPromptCursor, setNextPromptCursor] = useState<
-    string | undefined
-  >();
-  const [nextToolCursor, setNextToolCursor] = useState<string | undefined>();
-  const progressTokenRef = useRef(0);
+  const [resourceSubscriptions, setResourceSubscriptions] = useState<
+    Set<string>
+  >(new Set());
+  const progressTokenRef = useRef<number>(1);
+  const nextRequestId = useRef<number>(1);
+  const rootsRef = useRef<Root[]>([]);
+  const [authState, setAuthState] =
+    useState<AuthDebuggerState>(EMPTY_DEBUGGER_STATE);
+  const [isAuthDebuggerVisible, setIsAuthDebuggerVisible] = useState(false);
+  const updateAuthState = (updates: Partial<AuthDebuggerState>) =>
+    setAuthState((prev) => ({ ...prev, ...updates }));
 
+  // Always emit a startup log for on-device registry detection status baseline
+  useEffect(() => {
+    const isWin = navigator.userAgent.includes("Windows");
+    console.log("[on-device][client] Startup baseline", {
+      userAgent: navigator.userAgent,
+      isWindowsUserAgent: isWin,
+      initialState: onDeviceServers, // should be null initially
+    });
+  }, []);
   const [activeTab, setActiveTab] = useState<string>(() => {
     const hash = window.location.hash.slice(1);
     const initialTab = hash || "resources";
@@ -210,6 +227,7 @@ const App = () => {
     completionsSupported,
     connect: connectMcpServer,
     disconnect: disconnectMcpServer,
+    lastError,
   } = useConnection({
     transportType,
     command,
@@ -262,6 +280,38 @@ const App = () => {
     getRoots: () => rootsRef.current,
     defaultLoggingLevel: logLevel,
   });
+
+  useEffect(() => {
+    // Auto single retry if immediately bounced from connecting->disconnected with no error yet
+    if (
+      connectionStatus === "disconnected" &&
+      selectedOnDeviceServerId &&
+      lastError
+    ) {
+      // do not auto retry on explicit error
+      return;
+    }
+    if (
+      connectionStatus === "disconnected" &&
+      selectedOnDeviceServerId &&
+      !lastError
+    ) {
+      // Avoid spamming: only if we were just trying (recent timestamp) - simple heuristic using ref
+      // For now just log and allow user click again.
+      console.log(
+        "[on-device][client] Connect attempt ended quickly without error. Awaiting user re-click.",
+      );
+    }
+  }, [connectionStatus, selectedOnDeviceServerId, lastError]);
+
+  useEffect(() => {
+    if (lastError) {
+      console.warn(
+        "[on-device][client] Last connection error:",
+        lastError.message,
+      );
+    }
+  }, [lastError]);
 
   useEffect(() => {
     if (serverCapabilities) {
@@ -463,11 +513,67 @@ const App = () => {
         if (data.defaultServerUrl) {
           setSseUrl(data.defaultServerUrl);
         }
+        // Use pre-enumerated data if present in config
+        if (navigator.userAgent.includes("Windows")) {
+          if (data.onDeviceRegistry) {
+            console.log(
+              "[on-device][client] Using /config embedded registry data",
+              data.onDeviceRegistry,
+            );
+            setOnDeviceServers(data.onDeviceRegistry.servers || []);
+            setOnDeviceDiscoveryLoading(false);
+          } else {
+            // Fallback to explicit discovery endpoint
+            const startTs = performance.now();
+            console.log(
+              "[on-device][client] Beginning registry discovery (no pre-enumerated data)...",
+            );
+            const url = `${getMCPProxyAddress(config)}/on-device/available-servers`;
+            fetch(url, { headers })
+              .then(async (r) =>
+                r.ok ? r.json() : Promise.reject(await r.text()),
+              )
+              .then((disc) => {
+                if (Array.isArray(disc?.servers)) {
+                  setOnDeviceServers(disc.servers);
+                  console.log(
+                    `[on-device][client] Discovery -> ${disc.servers.length} server(s) (elapsed ${(performance.now() - startTs).toFixed(1)}ms).`,
+                  );
+                } else {
+                  setOnDeviceServers([]);
+                }
+              })
+              .catch((err) => {
+                console.log("[on-device][client] Discovery failed:", err);
+                setOnDeviceServers(null);
+              })
+              .finally(() => setOnDeviceDiscoveryLoading(false));
+          }
+        }
       })
-      .catch((error) =>
-        console.error("Error fetching default environment:", error),
-      );
+      .catch((error) => {
+        console.error("Error fetching default environment:", error);
+        setOnDeviceServers(null);
+        setOnDeviceDiscoveryLoading(false);
+      });
   }, [config]);
+
+  // Summary logger when determination made
+  useEffect(() => {
+    if (onDeviceServers === null) {
+      // Distinguish between initial state and post-detection: if Windows we already attempted fetch
+      // We log only after a short microtask to ensure fetch handlers had chance to set state
+      queueMicrotask(() => {
+        console.log(
+          "[on-device][client] Mode: STANDARD (on-device registry unavailable or detection failed). Sidebar=manual inputs.",
+        );
+      });
+    } else if (Array.isArray(onDeviceServers)) {
+      console.log(
+        `[on-device][client] Mode: ON-DEVICE REGISTRY (${onDeviceServers.length} server(s) discovered). Sidebar=server tiles.`,
+      );
+    }
+  }, [onDeviceServers]);
 
   useEffect(() => {
     rootsRef.current = roots;
@@ -506,7 +612,7 @@ const App = () => {
   }, [activeTab]);
 
   const handleApproveSampling = (id: number, result: CreateMessageResult) => {
-    setPendingSampleRequests((prev) => {
+    setPendingSampleRequests((prev: TrackedPendingRequest[]) => {
       const request = prev.find((r) => r.id === id);
       request?.resolve(result);
       return prev.filter((r) => r.id !== id);
@@ -514,7 +620,7 @@ const App = () => {
   };
 
   const handleRejectSampling = (id: number) => {
-    setPendingSampleRequests((prev) => {
+    setPendingSampleRequests((prev: TrackedPendingRequest[]) => {
       const request = prev.find((r) => r.id === id);
       request?.reject(new Error("Sampling request rejected"));
       return prev.filter((r) => r.id !== id);
@@ -525,38 +631,40 @@ const App = () => {
     id: number,
     response: ElicitationResponse,
   ) => {
-    setPendingElicitationRequests((prev) => {
-      const request = prev.find((r) => r.id === id);
-      if (request) {
-        request.resolve(response);
+    setPendingElicitationRequests(
+      (prev: TrackedPendingElicitationRequest[]) => {
+        const request = prev.find((r) => r.id === id);
+        if (request) {
+          request.resolve(response);
 
-        if (request.originatingTab) {
-          const originatingTab = request.originatingTab;
+          if (request.originatingTab) {
+            const originatingTab = request.originatingTab;
 
-          const validTabs = [
-            ...(serverCapabilities?.resources ? ["resources"] : []),
-            ...(serverCapabilities?.prompts ? ["prompts"] : []),
-            ...(serverCapabilities?.tools ? ["tools"] : []),
-            "ping",
-            "sampling",
-            "elicitations",
-            "roots",
-            "auth",
-          ];
+            const validTabs = [
+              ...(serverCapabilities?.resources ? ["resources"] : []),
+              ...(serverCapabilities?.prompts ? ["prompts"] : []),
+              ...(serverCapabilities?.tools ? ["tools"] : []),
+              "ping",
+              "sampling",
+              "elicitations",
+              "roots",
+              "auth",
+            ];
 
-          if (validTabs.includes(originatingTab)) {
-            setActiveTab(originatingTab);
-            window.location.hash = originatingTab;
-
-            setTimeout(() => {
+            if (validTabs.includes(originatingTab)) {
               setActiveTab(originatingTab);
               window.location.hash = originatingTab;
-            }, 100);
+
+              setTimeout(() => {
+                setActiveTab(originatingTab);
+                window.location.hash = originatingTab;
+              }, 100);
+            }
           }
         }
-      }
-      return prev.filter((r) => r.id !== id);
-    });
+        return prev.filter((r) => r.id !== id);
+      },
+    );
   };
 
   const clearError = (tabKey: keyof typeof errors) => {
@@ -805,36 +913,91 @@ const App = () => {
         }}
         className="bg-card border-r border-border flex flex-col h-full relative"
       >
-        <Sidebar
-          connectionStatus={connectionStatus}
-          transportType={transportType}
-          setTransportType={setTransportType}
-          command={command}
-          setCommand={setCommand}
-          args={args}
-          setArgs={setArgs}
-          sseUrl={sseUrl}
-          setSseUrl={setSseUrl}
-          env={env}
-          setEnv={setEnv}
-          config={config}
-          setConfig={setConfig}
-          bearerToken={bearerToken}
-          setBearerToken={setBearerToken}
-          headerName={headerName}
-          setHeaderName={setHeaderName}
-          oauthClientId={oauthClientId}
-          setOauthClientId={setOauthClientId}
-          oauthScope={oauthScope}
-          setOauthScope={setOauthScope}
-          onConnect={connectMcpServer}
-          onDisconnect={disconnectMcpServer}
-          stdErrNotifications={stdErrNotifications}
-          logLevel={logLevel}
-          sendLogLevelRequest={sendLogLevelRequest}
-          loggingSupported={!!serverCapabilities?.logging || false}
-          clearStdErrNotifications={clearStdErrNotifications}
-        />
+        {onDeviceServers === undefined ? (
+          // Still determining; show nothing to prevent flicker
+          <div className="flex-1 flex flex-col justify-center items-center text-xs text-muted-foreground">
+            <span>Loading on-device registry...</span>
+          </div>
+        ) : onDeviceServers !== null ? (
+          <OnDeviceSidebar
+            servers={onDeviceServers}
+            loading={onDeviceDiscoveryLoading}
+            errorMessage={lastError ? lastError.message : null}
+            refresh={() => {
+              const { token: proxyAuthToken, header: proxyAuthTokenHeader } =
+                getMCPProxyAuthToken(config);
+              const headers: HeadersInit = {};
+              if (proxyAuthToken)
+                headers[proxyAuthTokenHeader] = `Bearer ${proxyAuthToken}`;
+              fetch(
+                `${getMCPProxyAddress(config)}/on-device/available-servers`,
+                { headers },
+              )
+                .then(async (r) =>
+                  r.ok ? r.json() : Promise.reject(await r.text()),
+                )
+                .then((data) => setOnDeviceServers(data.servers || []))
+                .catch(() => {});
+            }}
+            onConnectServer={(srv) => {
+              // ODR servers are always launched via local executable: force stdio transport
+              if (transportType !== "stdio") {
+                console.log(
+                  "[on-device][client] Overriding transport type to stdio for on-device server",
+                  { previous: transportType, reported: srv.type },
+                );
+              }
+              setTransportType("stdio");
+              setCommand(srv.command);
+              setArgs((srv.args || []).join(" "));
+              setSelectedOnDeviceServerId(srv.id);
+              console.log("[on-device][client] Connect requested", {
+                serverId: srv.id,
+                transportType: "stdio",
+                command: srv.command,
+                args: srv.args,
+              });
+              // Defer connect until after state applied in same tick to avoid double click requirement
+              queueMicrotask(() => void connectMcpServer());
+            }}
+            connectionStatus={connectionStatus}
+            selectedServerId={selectedOnDeviceServerId}
+            setSelectedServerId={setSelectedOnDeviceServerId}
+            reconnect={() => void connectMcpServer()}
+            disconnect={disconnectMcpServer}
+          />
+        ) : (
+          <Sidebar
+            connectionStatus={connectionStatus}
+            transportType={transportType}
+            setTransportType={setTransportType}
+            command={command}
+            setCommand={setCommand}
+            args={args}
+            setArgs={setArgs}
+            sseUrl={sseUrl}
+            setSseUrl={setSseUrl}
+            env={env}
+            setEnv={setEnv}
+            config={config}
+            setConfig={setConfig}
+            bearerToken={bearerToken}
+            setBearerToken={setBearerToken}
+            headerName={headerName}
+            setHeaderName={setHeaderName}
+            oauthClientId={oauthClientId}
+            setOauthClientId={setOauthClientId}
+            oauthScope={oauthScope}
+            setOauthScope={setOauthScope}
+            onConnect={connectMcpServer}
+            onDisconnect={disconnectMcpServer}
+            stdErrNotifications={stdErrNotifications}
+            logLevel={logLevel}
+            sendLogLevelRequest={sendLogLevelRequest}
+            loggingSupported={!!serverCapabilities?.logging || false}
+            clearStdErrNotifications={clearStdErrNotifications}
+          />
+        )}
         <div
           onMouseDown={handleSidebarDragStart}
           style={{
