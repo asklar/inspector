@@ -124,6 +124,7 @@ const App = () => {
   const [selectedOnDeviceServerId, setSelectedOnDeviceServerId] = useState<
     string | null
   >(null);
+  const [debugFlag, setDebugFlag] = useState<boolean>(false);
 
   const [config, setConfig] = useState<InspectorConfig>(() =>
     initializeInspectorConfig(CONFIG_LOCAL_STORAGE_KEY),
@@ -498,6 +499,8 @@ const App = () => {
     fetch(`${getMCPProxyAddress(config)}/config`, { headers })
       .then((response) => response.json())
       .then((data) => {
+        (window as any).__MCP_INSPECTOR_DBG__ = !!data.mcpInspectorDebug;
+        setDebugFlag(!!data.mcpInspectorDebug);
         setEnv(data.defaultEnvironment);
         if (data.defaultCommand) {
           setCommand(data.defaultCommand);
@@ -513,23 +516,17 @@ const App = () => {
         if (data.defaultServerUrl) {
           setSseUrl(data.defaultServerUrl);
         }
-        // Use pre-enumerated data if present in config
+        // On-device registry handling (Windows)
         if (navigator.userAgent.includes("Windows")) {
-          if (data.onDeviceRegistry) {
-            console.log(
-              "[on-device][client] Using /config embedded registry data",
-              data.onDeviceRegistry,
-            );
-            setOnDeviceServers(data.onDeviceRegistry.servers || []);
-            setOnDeviceDiscoveryLoading(false);
-          } else {
-            // Fallback to explicit discovery endpoint
+          const triggerDiscovery = (reason: string) => {
             const startTs = performance.now();
             console.log(
-              "[on-device][client] Beginning registry discovery (no pre-enumerated data)...",
+              `[on-device][client] Triggering discovery endpoint (${reason})...`,
             );
-            const url = `${getMCPProxyAddress(config)}/on-device/available-servers`;
-            fetch(url, { headers })
+            setOnDeviceDiscoveryLoading(true);
+            fetch(`${getMCPProxyAddress(config)}/on-device/available-servers`, {
+              headers,
+            })
               .then(async (r) =>
                 r.ok ? r.json() : Promise.reject(await r.text()),
               )
@@ -548,6 +545,25 @@ const App = () => {
                 setOnDeviceServers(null);
               })
               .finally(() => setOnDeviceDiscoveryLoading(false));
+          };
+          const odr = data.onDeviceRegistry;
+          if (!odr) {
+            triggerDiscovery("/config missing onDeviceRegistry");
+          } else {
+            console.log("[on-device][client] /config onDeviceRegistry", odr);
+            if (odr.ready) {
+              setOnDeviceServers(odr.servers || []);
+              setOnDeviceDiscoveryLoading(false);
+              if ((odr.servers || []).length === 0) {
+                console.log(
+                  "[on-device][client] Ready flag true but zero servers returned; showing empty state.",
+                );
+              }
+            } else {
+              // Not ready yet, keep loading and kick discovery
+              setOnDeviceServers(undefined as any);
+              triggerDiscovery("registry not ready");
+            }
           }
         }
       })
@@ -923,6 +939,7 @@ const App = () => {
             servers={onDeviceServers}
             loading={onDeviceDiscoveryLoading}
             errorMessage={lastError ? lastError.message : null}
+            debug={debugFlag}
             refresh={() => {
               const { token: proxyAuthToken, header: proxyAuthTokenHeader } =
                 getMCPProxyAuthToken(config);
@@ -936,7 +953,9 @@ const App = () => {
                 .then(async (r) =>
                   r.ok ? r.json() : Promise.reject(await r.text()),
                 )
-                .then((data) => setOnDeviceServers(data.servers || []))
+                .then((data) => {
+                  setOnDeviceServers(data.servers || []);
+                })
                 .catch(() => {});
             }}
             onConnectServer={(srv) => {
@@ -957,8 +976,8 @@ const App = () => {
                 command: srv.command,
                 args: srv.args,
               });
-              // Defer connect until after state applied in same tick to avoid double click requirement
-              queueMicrotask(() => void connectMcpServer());
+              // Defer connect to next macrotask so React commits state (transportType/command/args) before hook reads them
+              setTimeout(() => void connectMcpServer(), 0);
             }}
             connectionStatus={connectionStatus}
             selectedServerId={selectedOnDeviceServerId}

@@ -90,6 +90,7 @@ const getHttpHeaders = (
 };
 
 const app = express();
+// Simple CORS (no credentials) – UI should determine ODR mode without relying on cookies
 app.use(cors());
 app.use((req, res, next) => {
   res.header("Access-Control-Expose-Headers", "mcp-session-id");
@@ -522,14 +523,24 @@ app.get("/health", (req, res) => {
   });
 });
 
-app.get("/config", originValidationMiddleware, authMiddleware, (req, res) => {
+app.get("/config", originValidationMiddleware, authMiddleware, (_req, res) => {
   try {
-    res.json({
+    const dbg = process.env.MCP_INSPECTOR_DBG === "1";
+    if (dbg) {
+      console.log(
+        "[debug]/config mcpInspectorDebug=1 ready=",
+        cachedOnDeviceRegistry?.ready,
+        "servers=",
+        cachedOnDeviceRegistry?.servers?.length ?? 0,
+      );
+    }
+    const payload = {
       defaultEnvironment,
       defaultCommand: values.command,
       defaultArgs: values.args,
       defaultTransport: values.transport,
       defaultServerUrl: values["server-url"],
+      mcpInspectorDebug: dbg,
       onDeviceRegistry: cachedOnDeviceRegistry
         ? {
             registryPath: cachedOnDeviceRegistry.registryPath,
@@ -539,7 +550,8 @@ app.get("/config", originValidationMiddleware, authMiddleware, (req, res) => {
             lastEnumerated: cachedOnDeviceRegistry.lastEnumerated,
           }
         : null,
-    });
+    };
+    res.json(payload);
   } catch (error) {
     console.error("Error in /config route:", error);
     res.status(500).json(error);
@@ -565,6 +577,9 @@ server.on("listening", () => {
       `⚠️  WARNING: Authentication is disabled. This is not recommended.`,
     );
   }
+  console.log(
+    `[debug] MCP_INSPECTOR_DBG='${process.env.MCP_INSPECTOR_DBG ?? ""}' (enabled=${process.env.MCP_INSPECTOR_DBG === "1"})`,
+  );
   // Kick off an async check for on-device registry availability purely for logging
   (async () => {
     try {
@@ -636,6 +651,8 @@ interface OnDeviceServerEntry {
   command: string;
   args?: string[];
   source?: string;
+  // Optional cookie value (e.g., for auth/debug) surfaced only when MCP_INSPECTOR_DBG=1 on the client
+  cookie?: string;
 }
 interface OnDeviceRegistryExecInfo {
   path: string;
@@ -759,9 +776,24 @@ async function listOnDeviceServers(
     }
     if (Array.isArray(parsed)) {
       const servers = parsed as OnDeviceServerEntry[];
+      const dbg = process.env.MCP_INSPECTOR_DBG === "1";
       servers.forEach((s, i) => {
+        // Heuristic: if cookie not provided explicitly, infer from args pattern: [ 'proxy', '<token>' ]
+        if (
+          dbg &&
+          !s.cookie &&
+          Array.isArray(s.args) &&
+          s.args.length >= 2 &&
+          s.args[0] === "proxy" &&
+          typeof s.args[1] === "string" &&
+          /^[A-Za-z0-9._-]{8,}$/.test(s.args[1])
+        ) {
+          s.cookie = s.args[1];
+        }
         console.log(
-          `[on-device] Server[${i}] id='${s.id}' name='${s.name}' type='${s.type}' command='${s.command}' args=${JSON.stringify(s.args || [])}`,
+          `[on-device] Server[${i}] id='${s.id}' name='${s.name}' type='${s.type}' command='${s.command}' args=${JSON.stringify(
+            s.args || [],
+          )}${dbg ? " debug=1" : ""}${dbg && s.cookie ? ` cookie='${s.cookie}'` : ""}`,
         );
       });
       return servers;

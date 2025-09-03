@@ -15,6 +15,7 @@ export interface OnDeviceServerEntry {
   command: string;
   args?: string[];
   source?: string;
+  cookie?: string; // optional debug cookie value
 }
 
 interface OnDeviceSidebarProps {
@@ -28,6 +29,7 @@ interface OnDeviceSidebarProps {
   reconnect: () => void;
   disconnect: () => void;
   errorMessage?: string | null;
+  debug?: boolean;
 }
 
 const OnDeviceSidebar: React.FC<OnDeviceSidebarProps> = ({
@@ -41,6 +43,7 @@ const OnDeviceSidebar: React.FC<OnDeviceSidebarProps> = ({
   reconnect,
   disconnect,
   errorMessage,
+  debug = false,
 }) => {
   const [theme, setTheme] = useTheme();
 
@@ -111,6 +114,14 @@ const OnDeviceSidebar: React.FC<OnDeviceSidebarProps> = ({
                   title={srv.description}
                 >
                   {srv.description}
+                </p>
+              )}
+              {debug && (
+                <p
+                  className="text-[10px] font-mono text-muted-foreground break-all mb-2"
+                  title={`cookie: ${srv.cookie || "(none)"}`}
+                >
+                  cookie: {srv.cookie || "(none)"}
                 </p>
               )}
               <div className="flex flex-wrap gap-1 mb-2">
