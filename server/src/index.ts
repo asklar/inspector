@@ -739,12 +739,12 @@ async function listOnDeviceServers(
   });
   try {
     await client.connect(transport);
-    // Call the registry_list tool
+    // Call the list_mcp_servers tool (renamed from registry_list)
     const result = await client.request(
       {
         method: "tools/call",
         params: {
-          name: "registry_list",
+          name: "list_mcp_servers",
           arguments: {},
           _meta: { progressToken: 0 },
         },
@@ -752,7 +752,7 @@ async function listOnDeviceServers(
       CompatibilityCallToolResultSchema,
     );
     console.log(
-      "[on-device] Raw registry_list tool result content:",
+      "[on-device] Raw list_mcp_servers tool result content:",
       (result as any).content,
     );
     // Expect first text content item to be JSON
@@ -767,11 +767,11 @@ async function listOnDeviceServers(
     try {
       parsed = JSON.parse(textItem.text);
       console.log(
-        "[on-device] Parsed registry_list JSON length:",
+        "[on-device] Parsed list_mcp_servers JSON length:",
         Array.isArray(parsed) ? parsed.length : "not-array",
       );
     } catch (e) {
-      console.error("Failed to parse registry_list tool output as JSON", e);
+      console.error("Failed to parse list_mcp_servers tool output as JSON", e);
       return [];
     }
     if (Array.isArray(parsed)) {
